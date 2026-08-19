@@ -277,36 +277,42 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
 
         return default_trend_callable()
 
-    def _get_seasonal_config(
+    def _resolve_season_lengths(
         self,
         uid: Union[str, int],
         series: np.ndarray,
-        seasonal_naive_model: Any,
-    ) -> Tuple[List[int], List[Any]]:
+    ) -> List[int]:
         """
-        Resolve the seasonal periods and models configured for a SKU.
+        Resolve, validate, and normalize seasonal periods for a specific series.
+
+        This method retrieves the configured `season_length` setting for the given
+        unique identifier (`uid`), handles automatic peak detection if configured as
+        `"auto"`, and sanitizes the input into a unique, strictly ascending list of
+        positive integer periods greater than one.
 
         Parameters
         ----------
         uid : str or int
-            Unique identifier of the series.
+            Unique identifier of the time series / SKU.
         series : ndarray of shape (n_samples,)
-            Target values used when ``season_length`` is ``"auto"``.
-        seasonal_naive_model : callable
-            SeasonalNaive constructor used by the default factory.
+            Target time series array used for automatic period detection when
+            `season_length` is set to `"auto"`.
 
         Returns
         -------
         season_lengths : list of int
-            Seasonal periods normalized as a list.
-        seasonal_models : list
-            Seasonal models normalized as a list, with one model per period.
+            Deduplicated, sorted list of positive integer seasonal periods strictly
+            greater than 1 (e.g., ``[7, 30]``).
 
         Raises
         ------
         ValueError
-            If the SKU has no configured periods or if a period is not a
-            positive integer greater than one.
+            If no `season_length` configuration is found for `uid`.
+            If automatic period detection (`"auto"`) fails to identify any significant
+            seasonal peaks via FFT.
+            If the parsed seasonal periods are empty, contain invalid types (e.g.,
+            booleans or non-numeric strings), or yield no valid integer periods
+            greater than 1.
         """
         season_length = self._get_sku_config(self.season_length, uid)
 
@@ -317,63 +323,161 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
             )
 
         if season_length == "auto":
-            detected_periods = detect_seasonal_periods(
+            raw_lengths = detect_seasonal_periods(
                 series, **self.seasonal_detection_params
             )
-            if not detected_periods:
+            if not raw_lengths:
                 raise ValueError(
                     f"Automatic seasonal detection failed for unique_id {uid!r}. "
                     "No significant seasonal peaks were identified via FFT. "
                     "Specify 'season_length' manually for this series."
                 )
-            season_lengths = detected_periods
         else:
-            season_lengths = (
-                [season_length] if isinstance(season_length, int) else season_length
+            raw_lengths = (
+                [season_length]
+                if isinstance(season_length, (int, float, np.integer))
+                else list(season_length)
             )
 
-        if (
-            not isinstance(season_lengths, list)
-            or not season_lengths
-            or len(set(season_lengths)) != len(season_lengths)
-            or any(
-                not isinstance(period, int) or isinstance(period, bool) or period <= 1
-                for period in season_lengths
-            )
-        ):
+        try:
+            clean_periods = []
+            for p in raw_lengths:
+
+                if isinstance(p, bool):
+                    continue
+
+                val = int(p)
+
+                if val <= 1:
+                    raise ValueError(
+                        f"Invalid seasonal period {val} for unique_id {uid!r}. "
+                        "Seasonal periods must be strictly greater than 1."
+                    )
+
+                clean_periods.append(val)
+
+            season_lengths = sorted(list(set(clean_periods)))
+        except (ValueError, TypeError):
             raise ValueError(
                 f"season_length for unique_id {uid!r} must contain positive "
                 "integer periods greater than one without duplicates."
             )
 
+        if not season_lengths:
+            raise ValueError(
+                f"season_length for unique_id {uid!r} must contain positive "
+                "integer periods greater than one without duplicates."
+            )
+
+        return season_lengths
+
+    def _build_seasonal_models(
+        self,
+        uid: Union[str, int],
+        season_lengths: List[int],
+        seasonal_naive_model: Any,
+    ) -> List[Any]:
+        """
+        Instantiate and configure seasonal model instances for resolved periods.
+
+        Builds one seasonal model instance per period provided in `season_lengths`.
+        If a custom callable factory (`seasonal_model_callable`) is configured for the
+        given SKU, it will be invoked for each period. Otherwise, the default
+        `seasonal_naive_model` constructor is instantiated with an explicit unique
+        `alias` to avoid model naming collisions in downstream pipelines.
+
+        Parameters
+        ----------
+        uid : str or int
+            Unique identifier of the time series / SKU.
+        season_lengths : list of int
+            Normalized list of integer seasonal periods.
+        seasonal_naive_model : callable
+            Default SeasonalNaive constructor used when no custom factory is configured.
+
+        Returns
+        -------
+        seasonal_models : list of object
+            List of instantiated seasonal model objects corresponding 1-to-1 with
+            `season_lengths`.
+
+        Raises
+        ------
+        TypeError
+            If the configured `seasonal_model_callable` for the given `uid` is not
+            callable.
+        """
         seasonal_model_callable = self._get_sku_config(
             self.seasonal_model_callable, uid
         )
+
         if seasonal_model_callable is None:
 
-            def seasonal_model_callable(period):
+            def default_factory(period: int):
                 try:
                     return seasonal_naive_model(
                         season_length=period,
                         alias=f"SeasonalNaive-{period}",
                     )
-                except TypeError as error:
-                    if "alias" not in str(error):
-                        raise
-                    return seasonal_naive_model(season_length=period)
+                except TypeError:
+                    model_inst = seasonal_naive_model(season_length=period)
+                    if hasattr(model_inst, "alias"):
+                        model_inst.alias = f"SeasonalNaive-{period}"
+                    return model_inst
 
-            seasonal_models = [
-                seasonal_model_callable(period) for period in season_lengths
-            ]
-        else:
-            if not callable(seasonal_model_callable):
-                raise TypeError(
-                    f"seasonal_model_callable for unique_id {uid!r} must be "
-                    "a callable that accepts one seasonal period."
-                )
-            seasonal_models = [
-                seasonal_model_callable(period) for period in season_lengths
-            ]
+            return [default_factory(period) for period in season_lengths]
+
+        if not callable(seasonal_model_callable):
+            raise TypeError(
+                f"seasonal_model_callable for unique_id {uid!r} must be "
+                "a callable that accepts one seasonal period."
+            )
+
+        return [seasonal_model_callable(period) for period in season_lengths]
+
+    def _get_seasonal_config(
+        self,
+        uid: Union[str, int],
+        series: np.ndarray,
+        seasonal_naive_model: Any,
+    ) -> Tuple[List[int], List[Any]]:
+        """
+        Orchestrate seasonal configuration resolution and model instantiation for a SKU.
+
+        Combines period resolution (`_resolve_season_lengths`) and model construction
+        (`_build_seasonal_models`) into a single step, returning normalized seasonal
+        periods along with their associated instantiated models.
+
+        Parameters
+        ----------
+        uid : str or int
+            Unique identifier of the time series / SKU.
+        series : ndarray of shape (n_samples,)
+            Target time series array used for automatic period detection when
+            `season_length` is set to `"auto"`.
+        seasonal_naive_model : callable
+            Default SeasonalNaive constructor used when no custom factory is configured.
+
+        Returns
+        -------
+        season_lengths : list of int
+            Deduplicated, sorted list of integer seasonal periods.
+        seasonal_models : list of object
+            List of initialized seasonal model instances, mapped 1-to-1 with
+            `season_lengths`.
+
+        Raises
+        ------
+        ValueError
+            If seasonal periods resolution fails due to missing configs, invalid
+            types, non-positive periods, or FFT detection failure.
+        TypeError
+            If the configured SKU model factory is not callable.
+        """
+        season_lengths = self._resolve_season_lengths(uid, series)
+        seasonal_models = self._build_seasonal_models(
+            uid, season_lengths, seasonal_naive_model
+        )
 
         return season_lengths, seasonal_models
 
@@ -481,11 +585,11 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
             raise ValueError("residual_model_callable must be provided.")
 
         try:
-            mf_resid = residual_callable(nlags=nlags, freq=self.freq_)
+            residual_mlforecast = residual_callable(nlags=nlags, freq=self.freq_)
         except TypeError:
-            mf_resid = residual_callable(nlags, self.freq_)
+            residual_mlforecast = residual_callable(nlags, self.freq_)
 
-        mf_resid.fit(
+        residual_mlforecast.fit(
             group,
             id_col=self.id_col_,
             time_col=self.time_col_,
@@ -493,7 +597,7 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
             prediction_intervals=prediction_intervals,
             static_features=static_features,
         )
-        return mf_resid
+        return residual_mlforecast
 
     @requires_extra("series")
     def fit(
@@ -545,17 +649,6 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
             )
 
         self.freq_ = self.freq
-
-        self.season_length_ = (
-            self.season_length
-            if isinstance(self.season_length, dict)
-            else (
-                [self.season_length]
-                if isinstance(self.season_length, int)
-                else self.season_length
-            )
-        )
-
         self.id_col_ = id_col
         self.time_col_ = time_col
         self.target_col_ = target_col
@@ -617,7 +710,7 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
 
         global_residual_df = pd.concat(residual_dfs, ignore_index=True)
 
-        self.mf_resid_ = self._fit_mlforecast(
+        self.residual_mlforecast_ = self._fit_mlforecast(
             global_residual_df,
             prediction_intervals=prediction_intervals,
             static_features=static_features,
@@ -714,7 +807,9 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
             )
 
         preds_list = []
-        df_resid_preds = self.mf_resid_.predict(h=h, X_df=X_df, level=level).copy()
+        df_resid_preds = self.residual_mlforecast_.predict(
+            h=h, X_df=X_df, level=level
+        ).copy()
 
         for uid, models in self.fitted_models_.items():
             sf_trend = models["trend"]
