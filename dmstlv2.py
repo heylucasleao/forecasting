@@ -462,11 +462,23 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
         fitted_mf : MLForecast
             Fitted deep copy of the base MLForecast instance.
         """
+        rvalues = self.skus_nlags_.values()
+        flattened = []
 
-        all_lags = [lag for lags in self.skus_nlags_.values() for lag in lags]
-        max_lag = max(all_lags) if all_lags else 1
-        nlags = list(range(1, max_lag + 1))
-        residual_callable = self.residual_model_callable
+        for item in rvalues:
+            if isinstance(item, (list, tuple, np.ndarray)):
+                flattened.extend(item)
+            else:
+                flattened.append(item)
+
+        nlags = sorted(list(set(int(x) for x in flattened)))
+        if not nlags:
+            nlags = [1]
+
+        residual_callable = self._get_sku_config(self.residual_model_callable, None)
+
+        if residual_callable is None:
+            raise ValueError("residual_model_callable must be provided.")
 
         try:
             mf_resid = residual_callable(nlags=nlags, freq=self.freq_)
