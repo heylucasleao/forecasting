@@ -333,35 +333,41 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
                     "Specify 'season_length' manually for this series."
                 )
         else:
-            raw_lengths = (
-                [season_length]
-                if isinstance(season_length, (int, float, np.integer))
-                else list(season_length)
-            )
-
-        try:
-            clean_periods = []
-            for p in raw_lengths:
-
-                if isinstance(p, bool):
-                    continue
-
-                val = int(p)
-
-                if val <= 1:
+            if isinstance(season_length, (int, float, np.integer)):
+                raw_lengths = [season_length]
+            else:
+                try:
+                    raw_lengths = list(season_length)
+                except TypeError:
                     raise ValueError(
-                        f"Invalid seasonal period {val} for unique_id {uid!r}. "
-                        "Seasonal periods must be strictly greater than 1."
+                        f"season_length for unique_id {uid!r} must be an integer, "
+                        "list of integers, or 'auto'."
                     )
 
-                clean_periods.append(val)
+        clean_periods = []
+        for p in raw_lengths:
+            if isinstance(p, bool):
+                raise ValueError(
+                    f"Invalid seasonal period type {type(p).__name__} for unique_id {uid!r}."
+                )
 
-            season_lengths = sorted(list(set(clean_periods)))
-        except (ValueError, TypeError):
-            raise ValueError(
-                f"season_length for unique_id {uid!r} must contain positive "
-                "integer periods greater than one without duplicates."
-            )
+            try:
+                val = int(p)
+            except (ValueError, TypeError):
+                raise ValueError(
+                    f"season_length for unique_id {uid!r} contains unparseable "
+                    f"period value {p!r}."
+                )
+
+            if val <= 1:
+                raise ValueError(
+                    f"Invalid seasonal period {val} for unique_id {uid!r}. "
+                    "Seasonal periods must be strictly greater than 1."
+                )
+
+            clean_periods.append(val)
+
+        season_lengths = sorted(list(set(clean_periods)))
 
         if not season_lengths:
             raise ValueError(
