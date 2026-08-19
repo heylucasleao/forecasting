@@ -20,5 +20,5 @@ dependencies = [
     "plotly>=6.3.1",
     "seaborn>=0.13.2",
     "statsforecast>=2.0.2",
-    "tinyshift[all]==1.5.7",
+    "tinyshift[all]==1.6.1",
 ]
