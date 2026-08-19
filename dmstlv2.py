@@ -605,36 +605,6 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
         )
         return residual_mlforecast
 
-    def _validate_time_grid(self, df: pd.DataFrame) -> None:
-        """Validates target nulls and strict time grid continuity per series using pure Pandas."""
-
-        if df[self.target_col_].isnull().any():
-            raise ValueError(
-                f"Target column '{self.target_col_}' contains null/NaN values."
-            )
-
-        gaps_found = []
-
-        for uid, group in df.groupby(self.id_col_):
-            dates = pd.to_datetime(group[self.time_col_]).sort_values()
-
-            expected_range = pd.date_range(
-                start=dates.min(), end=dates.max(), freq=self.freq_
-            )
-
-            if len(dates) != len(expected_range) or not dates.equals(
-                pd.Series(expected_range)
-            ):
-                gaps_found.append(str(uid))
-
-        if gaps_found:
-            raise ValueError(
-                f"Detected temporal gaps/missing dates in {len(gaps_found)} series "
-                f"(e.g., {gaps_found[:3]}). MSTL requires a continuous time grid at "
-                f"frequency '{self.freq_}'. Preprocess your data using gap-filling "
-                f"methods (e.g., `utilsforecast.preprocessing.fill_gaps`) before calling `fit()`."
-            )
-
     @requires_extra("series")
     def fit(
         self,
@@ -694,8 +664,6 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
         self.fitted_models_ = {}
         self.skus_nlags_ = {}
         residual_dfs = []
-
-        self._validate_time_grid(df)
 
         for uid, group in df.groupby(id_col):
             group_sorted = group.sort_values(time_col).copy()
