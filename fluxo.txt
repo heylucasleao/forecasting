@@ -1,0 +1,8 @@
+tinyshift/
+│
+└── series/
+    └── dmstl/
+        ├── __init__.py           # Exporta a Factory ou as classes públicas
+        ├── base.py               # Core: Lógica compartilhada de MSTL, Sazonalidade e PAMI
+        ├── local.py              # DMSTLLocalWrapper (Ajusta MLForecast por SKU)
+        └── global_.py            # DMSTLGlobalWrapper (Ajusta MLForecast Único com Painel)
