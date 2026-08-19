@@ -212,7 +212,8 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
         return [c for c in df.columns if c not in [self.id_col_, self.time_col_]]
 
     def _process_components(
-        self, components_df: pd.DataFrame, split_seasonal: bool = False
+        self,
+        components_df: pd.DataFrame,
     ) -> Tuple[np.ndarray, Union[np.ndarray, List[np.ndarray]], np.ndarray]:
         """
         Impute missing values and aggregate trend, seasonal, and residual signals.
@@ -234,12 +235,9 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
         """
         trend_part = components_df["trend"].bfill().ffill().values
         seasonal_cols = [c for c in components_df.columns if c.startswith("seasonal")]
-        if split_seasonal:
-            seasonal_part = [
-                components_df[column].fillna(0.0).values for column in seasonal_cols
-            ]
-        else:
-            seasonal_part = components_df[seasonal_cols].sum(axis=1).values
+        seasonal_part = [
+            components_df[column].fillna(0.0).values for column in seasonal_cols
+        ]
         residual_part = components_df["resid"].fillna(0.0).values
         return trend_part, seasonal_part, residual_part
 
@@ -465,14 +463,10 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
             Fitted deep copy of the base MLForecast instance.
         """
 
-        residual_callable = self._get_sku_config(self.residual_model_callable, None)
-
-        max_lag = (
-            max(max(lags) for lags in self.skus_nlags_.values())
-            if self.skus_nlags_
-            else 1
-        )
+        all_lags = [lag for lags in self.skus_nlags_.values() for lag in lags]
+        max_lag = max(all_lags) if all_lags else 1
         nlags = list(range(1, max_lag + 1))
+        residual_callable = self.residual_model_callable
 
         try:
             mf_resid = residual_callable(nlags=nlags, freq=self.freq_)
@@ -579,7 +573,7 @@ class DMSTLWrapperV2(BaseEstimator, RegressorMixin):
             res = mstl.fit()
             components_df = extract_mstl_components(res, season_lengths)
             trend_part, seasonal_parts, residual_part = self._process_components(
-                components_df, split_seasonal=True
+                components_df
             )
             self.skus_nlags_[uid] = self._get_residual_lags(uid, residual_part)
 
