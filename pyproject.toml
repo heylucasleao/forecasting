@@ -20,6 +20,7 @@ dependencies = [
     "plotly>=6.3.1",
     "seaborn>=0.13.2",
     "statsforecast>=2.0.2",
-    "tinyshift[all]==1.6.1",
+    "tinyconformal[notebook]>=0.5.4",
+    "tinyshift[all]==1.7.7",
     "window-ops>=0.0.15",
 ]
