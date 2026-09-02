@@ -41,7 +41,7 @@ from tinyconformal.series import (
 
 SEED = 42
 H = 14
-N_WINDOWS = 5
+N_WINDOWS = 12
 LEVEL = 0.90
 DATA_DIR = Path("data/tsf_cps")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -58,10 +58,12 @@ HELPERS = r'''def make_forecaster(freq, lags):
     return MLForecast(models={"LGBM": model}, freq=freq, lags=lags)
 
 
-def fit_tsf(train, freq, lags, family, h=H, n_windows=N_WINDOWS):
+def fit_tsf(train, freq, lags, family, h=H, n_windows=N_WINDOWS, step_size=None):
     model = TwoStageForecasterWrapper(make_forecaster(freq, lags), distribution=family)
     tic = perf_counter()
-    model.fit(train, h=h, n_windows=n_windows, refit=True)
+    model.fit(
+        train, h=h, n_windows=n_windows, step_size=step_size, refit=True
+    )
     fit_seconds = perf_counter() - tic
     tic = perf_counter()
     forecast = model.predict_distribution(h=h)
@@ -69,7 +71,9 @@ def fit_tsf(train, freq, lags, family, h=H, n_windows=N_WINDOWS):
     return model, forecast, fit_seconds, predict_seconds
 
 
-def fit_cps(train, freq, lags, discrete, h=H, n_windows=N_WINDOWS):
+def fit_cps(
+    train, freq, lags, discrete, h=H, n_windows=N_WINDOWS, step_size=None
+):
     cls = (DiscreteTimeSeriesConformalPredictiveSystem if discrete
            else ContinuousTimeSeriesConformalPredictiveSystem)
     model = cls(
@@ -80,7 +84,7 @@ def fit_cps(train, freq, lags, discrete, h=H, n_windows=N_WINDOWS):
         horizon=h, n_windows=n_windows, alpha=1-LEVEL,
     )
     tic = perf_counter()
-    model.fit(train, n_jobs=1)
+    model.fit(train, step_size=step_size, n_jobs=1)
     fit_seconds = perf_counter() - tic
     tic = perf_counter()
     forecast = model.predict_distribution(h=h)
@@ -216,10 +220,15 @@ def benchmark_cell(discrete, weibull=False):
 for dataset_name, df in datasets.items():
     freq = "MS" if dataset_name == "AirPassengers" else ("h" if "Bike" in dataset_name else "D")
     lags = [1, 12] if freq == "MS" else ([1, 24, 168] if freq == "h" else [1, 7, 28])
+    step_size = 3 if dataset_name == "AirPassengers" else 7
     train, test = temporal_split(df)
 
-    tsf, tsf_fc, tsf_fit, tsf_pred = fit_tsf(train, freq, lags, {family})
-    cps, cps_fc, cps_fit, cps_pred = fit_cps(train, freq, lags, discrete={discrete})
+    tsf, tsf_fc, tsf_fit, tsf_pred = fit_tsf(
+        train, freq, lags, {family}, step_size=step_size
+    )
+    cps, cps_fc, cps_fit, cps_pred = fit_cps(
+        train, freq, lags, discrete={discrete}, step_size=step_size
+    )
     tsf_tab = prediction_table(tsf_fc, test)
     cps_tab = prediction_table(cps_fc, test)
     predictions[(dataset_name, "TSF")] = tsf_tab
@@ -269,20 +278,25 @@ print("Leitura: cobertura isolada não premia intervalos excessivamente largos; 
 def notebook(title, intro, loader, discrete, weibull=False, timing_only=False):
     nb = nbf.v4.new_notebook()
     cells = [md(f"# {title}\n\n{intro}"), code(SETUP), code(HELPERS), code(loader)]
-    cells += [md("## Benchmark temporal\n\nA última janela é teste; todas as janelas anteriores são treino/calibração. O mesmo LightGBM, lags, horizonte e número de janelas são usados por TSF e CPS."), code(benchmark_cell(discrete, weibull))]
+    cells += [md("## Benchmark temporal\n\nA última janela é teste; todas as janelas anteriores são treino/calibração. O mesmo LightGBM, lags, horizonte, 12 janelas e sobreposição são usados por TSF e CPS. `step_size=3` em AirPassengers e `step_size=7` nas demais séries; como ambos são menores que `H=14`, as janelas se sobrepõem."), code(benchmark_cell(discrete, weibull))]
     if timing_only:
-        cells += [md("## Comparação de tempo\n\nOs tempos abaixo são medições locais desta execução (`perf_counter`), com `n_jobs=1` e cinco repetições da predição para reduzir ruído."), code(r'''timings = []
+        cells += [md("## Comparação de tempo\n\nOs tempos abaixo são medições locais desta execução (`perf_counter`), com `n_jobs=1` e três repetições completas para reduzir ruído."), code(r'''timings = []
 for dataset_name, df in datasets.items():
     freq = "MS" if dataset_name == "AirPassengers" else "D"
     lags = [1, 12] if freq == "MS" else [1, 7, 28]
+    step_size = 3 if dataset_name == "AirPassengers" else 7
     train, _ = temporal_split(df)
     for method in ["TSF", "CPS"]:
         fit_times, pred_times = [], []
         for repeat in range(3):
             if method == "TSF":
-                _, _, ft, pt = fit_tsf(train, freq, lags, WeibullFamily())
+                _, _, ft, pt = fit_tsf(
+                    train, freq, lags, WeibullFamily(), step_size=step_size
+                )
             else:
-                _, _, ft, pt = fit_cps(train, freq, lags, discrete=False)
+                _, _, ft, pt = fit_cps(
+                    train, freq, lags, discrete=False, step_size=step_size
+                )
             fit_times.append(ft); pred_times.append(pt)
         timings.append({"dataset": dataset_name, "method": method,
                         "fit_mediana_s": np.median(fit_times),
