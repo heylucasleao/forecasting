@@ -1,4 +1,4 @@
-"""Build the three reproducible TSF vs CPS benchmark notebooks."""
+"""Build the reproducible TSF, CPS, TSCQR, and MSCP benchmark notebooks."""
 
 from pathlib import Path
 import nbformat as nbf
@@ -35,6 +35,8 @@ from tinyshift.forecasting import (
     WeibullFamily,
 )
 from tinyconformal.series import (
+    ConformalDistributionTimeSeriesRegressor,
+    ConformalQuantileTimeSeriesRegressor,
     ContinuousTimeSeriesConformalPredictiveSystem,
     DiscreteTimeSeriesConformalPredictiveSystem,
 )
@@ -56,6 +58,27 @@ HELPERS = r'''def make_forecaster(freq, lags):
         verbosity=-1, random_state=SEED, n_jobs=1,
     )
     return MLForecast(models={"LGBM": model}, freq=freq, lags=lags)
+
+
+def make_quantile_forecaster(freq, lags, level=LEVEL):
+    alpha = 1-level
+    models = {
+        "LGBM": LGBMRegressor(
+            n_estimators=120, learning_rate=0.05, num_leaves=15,
+            verbosity=-1, random_state=SEED, n_jobs=1,
+        ),
+        "LGBM-lo-90": LGBMRegressor(
+            objective="quantile", alpha=alpha/2, n_estimators=120,
+            learning_rate=0.05, num_leaves=15, verbosity=-1,
+            random_state=SEED, n_jobs=1,
+        ),
+        "LGBM-hi-90": LGBMRegressor(
+            objective="quantile", alpha=1-alpha/2, n_estimators=120,
+            learning_rate=0.05, num_leaves=15, verbosity=-1,
+            random_state=SEED, n_jobs=1,
+        ),
+    }
+    return MLForecast(models=models, freq=freq, lags=lags)
 
 
 def fit_tsf(train, freq, lags, family, h=H, n_windows=N_WINDOWS, step_size=None):
@@ -92,6 +115,34 @@ def fit_cps(
     return model, forecast, fit_seconds, predict_seconds
 
 
+def fit_tscqr(train, freq, lags, h=H, n_windows=N_WINDOWS, step_size=None):
+    model = ConformalQuantileTimeSeriesRegressor(
+        learner=make_quantile_forecaster(freq, lags), horizon=h,
+        intervals=("LGBM-lo-90", "LGBM-hi-90"), n_windows=n_windows,
+    )
+    tic = perf_counter()
+    model.fit(train, step_size=step_size, n_jobs=1)
+    fit_seconds = perf_counter() - tic
+    tic = perf_counter()
+    forecast = model.predict_interval(h=h)
+    predict_seconds = perf_counter() - tic
+    return model, forecast, fit_seconds, predict_seconds
+
+
+def fit_mscp(train, freq, lags, h=H, n_windows=N_WINDOWS, step_size=None):
+    model = ConformalDistributionTimeSeriesRegressor(
+        learner=make_forecaster(freq, lags), horizon=h,
+        n_windows=n_windows, alpha=1-LEVEL,
+    )
+    tic = perf_counter()
+    model.fit(train, step_size=step_size, n_jobs=1)
+    fit_seconds = perf_counter() - tic
+    tic = perf_counter()
+    forecast = model.predict_interval(h=h)
+    predict_seconds = perf_counter() - tic
+    return model, forecast, fit_seconds, predict_seconds
+
+
 def prediction_table(forecast, test, level=LEVEL):
     base = forecast.to_frame().copy()
     intervals = forecast.interval(level)
@@ -104,6 +155,24 @@ def prediction_table(forecast, test, level=LEVEL):
     out["lower"] = intervals[lo_col].to_numpy()
     out["upper"] = intervals[hi_col].to_numpy()
     out["median"] = quantiles[median_col].to_numpy()
+    return out
+
+
+def conformal_prediction_table(forecast, test, method):
+    out = forecast.merge(
+        test[["unique_id", "ds", "y"]],
+        on=["unique_id", "ds"], validate="one_to_one",
+    )
+    if method == "TSCQR":
+        out["lower"] = out["LGBM-lo-90-cqr"]
+        out["upper"] = out["LGBM-hi-90-cqr"]
+        out["median"] = out["LGBM"]
+    elif method == "MSCP":
+        out["lower"] = out["LGBM-lo-90"]
+        out["upper"] = out["LGBM-hi-90"]
+        out["median"] = out["LGBM"]
+    else:
+        raise ValueError(f"Método conformal desconhecido: {method}")
     return out
 
 
@@ -229,13 +298,25 @@ for dataset_name, df in datasets.items():
     cps, cps_fc, cps_fit, cps_pred = fit_cps(
         train, freq, lags, discrete={discrete}, step_size=step_size
     )
+    tscqr, tscqr_fc, tscqr_fit, tscqr_pred = fit_tscqr(
+        train, freq, lags, step_size=step_size
+    )
+    mscp, mscp_fc, mscp_fit, mscp_pred = fit_mscp(
+        train, freq, lags, step_size=step_size
+    )
     tsf_tab = prediction_table(tsf_fc, test)
     cps_tab = prediction_table(cps_fc, test)
+    tscqr_tab = conformal_prediction_table(tscqr_fc, test, "TSCQR")
+    mscp_tab = conformal_prediction_table(mscp_fc, test, "MSCP")
     predictions[(dataset_name, "TSF")] = tsf_tab
     predictions[(dataset_name, "CPS")] = cps_tab
+    predictions[(dataset_name, "TSCQR")] = tscqr_tab
+    predictions[(dataset_name, "MSCP")] = mscp_tab
     results += [
         metrics(tsf_tab, "TSF", dataset_name, tsf_fit, tsf_pred),
         metrics(cps_tab, "CPS", dataset_name, cps_fit, cps_pred),
+        metrics(tscqr_tab, "TSCQR", dataset_name, tscqr_fit, tscqr_pred),
+        metrics(mscp_tab, "MSCP", dataset_name, mscp_fit, mscp_pred),
     ]
 
 resultados = pd.DataFrame(results)
@@ -246,7 +327,7 @@ display(resultados.pivot(index="dataset", columns="method",
 
 PLOTS = r'''for dataset_name in datasets:
     plot_intervals(
-        {method: predictions[(dataset_name, method)] for method in ["TSF", "CPS"]},
+        {method: predictions[(dataset_name, method)] for method in ["TSF", "CPS", "TSCQR", "MSCP"]},
         dataset_name,
     )
 
@@ -278,7 +359,7 @@ print("Leitura: cobertura isolada não premia intervalos excessivamente largos; 
 def notebook(title, intro, loader, discrete, weibull=False, timing_only=False):
     nb = nbf.v4.new_notebook()
     cells = [md(f"# {title}\n\n{intro}"), code(SETUP), code(HELPERS), code(loader)]
-    cells += [md("## Benchmark temporal\n\nA última janela é teste; todas as janelas anteriores são treino/calibração. O mesmo LightGBM, lags, horizonte, 12 janelas e sobreposição são usados por TSF e CPS. `step_size=3` em AirPassengers e `step_size=7` nas demais séries; como ambos são menores que `H=14`, as janelas se sobrepõem."), code(benchmark_cell(discrete, weibull))]
+    cells += [md("## Benchmark temporal\n\nA última janela é teste; todas as janelas anteriores são treino/calibração. O mesmo LightGBM, lags, horizonte, 12 janelas e sobreposição são usados por TSF, CPS, TSCQR e MSCP. `step_size=3` em AirPassengers e `step_size=7` nas demais séries; como ambos são menores que `H=14`, as janelas se sobrepõem."), code(benchmark_cell(discrete, weibull))]
     if timing_only:
         cells += [md("## Comparação de tempo\n\nOs tempos abaixo são medições locais desta execução (`perf_counter`), com `n_jobs=1` e três repetições completas para reduzir ruído."), code(r'''timings = []
 for dataset_name, df in datasets.items():
@@ -286,16 +367,24 @@ for dataset_name, df in datasets.items():
     lags = [1, 12] if freq == "MS" else [1, 7, 28]
     step_size = 3 if dataset_name == "AirPassengers" else 7
     train, _ = temporal_split(df)
-    for method in ["TSF", "CPS"]:
+    for method in ["TSF", "CPS", "TSCQR", "MSCP"]:
         fit_times, pred_times = [], []
         for repeat in range(3):
             if method == "TSF":
                 _, _, ft, pt = fit_tsf(
                     train, freq, lags, WeibullFamily(), step_size=step_size
                 )
-            else:
+            elif method == "CPS":
                 _, _, ft, pt = fit_cps(
                     train, freq, lags, discrete=False, step_size=step_size
+                )
+            elif method == "TSCQR":
+                _, _, ft, pt = fit_tscqr(
+                    train, freq, lags, step_size=step_size
+                )
+            else:
+                _, _, ft, pt = fit_mscp(
+                    train, freq, lags, step_size=step_size
                 )
             fit_times.append(ft); pred_times.append(pt)
         timings.append({"dataset": dataset_name, "method": method,
@@ -312,7 +401,7 @@ for ax in axes: ax.tick_params(axis="x", rotation=20)
 plt.tight_layout()''')]
     else:
         cells += [md("## Visualização e síntese"), code(PLOTS), code(INTERPRET)]
-    cells += [md("## Reprodutibilidade e ressalvas\n\n- Não há geração de dados sintéticos. As URLs/fontes estão explícitas no notebook.\n- Resultados dependem de hardware, versões e da janela temporal escolhida.\n- M5 exige aceitar as regras da competição e autenticar o Kaggle uma única vez.\n- TSF é paramétrico; CPS usa resíduos conformais empíricos. Nenhum método domina necessariamente em todos os critérios.")]
+    cells += [md("## Reprodutibilidade e ressalvas\n\n- Não há geração de dados sintéticos. As URLs/fontes estão explícitas no notebook.\n- Resultados dependem de hardware, versões e da janela temporal escolhida.\n- M5 exige aceitar as regras da competição e autenticar o Kaggle uma única vez.\n- TSF é paramétrico; CPS, TSCQR e MSCP usam calibração conformal. Nenhum método domina necessariamente em todos os critérios.")]
     nb.cells = cells
     nb.metadata.kernelspec = {"display_name": "Python 3", "language": "python", "name": "python3"}
     nb.metadata.language_info = {"name": "python", "version": "3.10"}
@@ -321,18 +410,18 @@ plt.tight_layout()''')]
 
 notebooks = {
     "12_tsf_vs_cps_discretos.ipynb": notebook(
-        "TSF vs CPS — dados discretos reais",
-        "Comparação entre o **Two-Stage Forecaster (TSF)** do `tinyshift` e o **Conformal Predictive System (CPS)** do `tinyconformal` em M5 e UCI Bike Sharing. Ambos são avaliados fora da amostra, com alvos inteiros e sem dados sintéticos.",
+        "TSF vs CPS vs TSCQR vs MSCP — dados discretos reais",
+        "Comparação entre **TSF**, **CPS**, **TSCQR** e **MSCP** em M5 e UCI Bike Sharing. Todos são avaliados fora da amostra, com alvos inteiros e sem dados sintéticos.",
         DISCRETE_LOADERS, True,
     ),
     "13_tsf_vs_cps_continuos.ipynb": notebook(
-        "TSF vs CPS — dados contínuos reais",
-        "Comparação probabilística em duas séries públicas reais: AirPassengers e temperaturas mínimas diárias de Melbourne. Para o TSF é usada a família Weibull, adequada ao suporte estritamente positivo observado.",
+        "TSF vs CPS vs TSCQR vs MSCP — dados contínuos reais",
+        "Comparação probabilística de **TSF**, **CPS**, **TSCQR** e **MSCP** em duas séries públicas reais: AirPassengers e temperaturas mínimas diárias de Melbourne. Para o TSF é usada a família Weibull, adequada ao suporte estritamente positivo observado.",
         CONT_LOADERS, False, weibull=True,
     ),
     "14_tsf_vs_cps_tempo_weibull.ipynb": notebook(
-        "TSF vs CPS — avaliação de tempo (TSF WeibullFamily)",
-        "Benchmark de ajuste e predição usando os mesmos dados contínuos reais. O TSF é configurado explicitamente com `WeibullFamily`; o CPS permanece semiparamétrico/conformal.",
+        "TSF vs CPS vs TSCQR vs MSCP — avaliação de tempo",
+        "Benchmark de ajuste e predição usando os mesmos dados contínuos reais. O TSF é configurado explicitamente com `WeibullFamily`; CPS, TSCQR e MSCP usam calibração conformal.",
         CONT_LOADERS, False, weibull=True, timing_only=True,
     ),
 }
