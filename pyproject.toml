@@ -21,6 +21,6 @@ dependencies = [
     "seaborn>=0.13.2",
     "statsforecast>=2.0.2",
     "tinyconformal[notebook]>=0.5.4",
-    "tinyshift[all]==1.7.7",
+    "tinyshift[all] @ git+https://github.com/HeyLucasLeao/tinyshift.git@feature/decay",
     "window-ops>=0.0.15",
 ]

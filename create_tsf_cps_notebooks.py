@@ -81,11 +81,15 @@ def make_quantile_forecaster(freq, lags, level=LEVEL):
     return MLForecast(models=models, freq=freq, lags=lags)
 
 
-def fit_tsf(train, freq, lags, family, h=H, n_windows=N_WINDOWS, step_size=None):
+def fit_tsf(
+    train, freq, lags, family, nexcp, weighted_refit,
+    h=H, n_windows=N_WINDOWS, step_size=None, decay=0.99,
+):
     model = TwoStageForecasterWrapper(make_forecaster(freq, lags), distribution=family)
     tic = perf_counter()
     model.fit(
-        train, h=h, n_windows=n_windows, step_size=step_size, refit=True
+        train, horizon=h, n_windows=n_windows, step_size=step_size,
+        nexcp=nexcp, decay=decay, weighted_refit=weighted_refit,
     )
     fit_seconds = perf_counter() - tic
     tic = perf_counter()
@@ -148,10 +152,18 @@ def prediction_table(forecast, test, level=LEVEL):
     intervals = forecast.interval(level)
     quantiles = forecast.ppf([0.5])
     out = base.merge(test[["unique_id", "ds", "y"]], on=["unique_id", "ds"], validate="one_to_one")
-    # APIs preservam a ordem do painel e nomeiam explicitamente os outputs.
-    lo_col = next(c for c in intervals if "-lo-" in c)
-    hi_col = next(c for c in intervals if "-hi-" in c)
-    median_col = next(c for c in quantiles if "-q-50" in c)
+    # A branch feature/decay usa Q(0.05), Q(0.5), Q(0.95); versões
+    # anteriores usavam sufixos -lo-, -q-50 e -hi-. Em ambos os casos,
+    # as colunas projetadas são as únicas que não pertencem ao frame-base.
+    interval_cols = [c for c in intervals if c not in base.columns]
+    median_cols = [c for c in quantiles if c not in base.columns]
+    if len(interval_cols) != 2 or len(median_cols) != 1:
+        raise ValueError(
+            "Formato inesperado do forecast: "
+            f"intervalos={interval_cols}, mediana={median_cols}"
+        )
+    lo_col, hi_col = interval_cols
+    median_col = median_cols[0]
     out["lower"] = intervals[lo_col].to_numpy()
     out["upper"] = intervals[hi_col].to_numpy()
     out["median"] = quantiles[median_col].to_numpy()
@@ -292,9 +304,21 @@ for dataset_name, df in datasets.items():
     step_size = 3 if dataset_name == "AirPassengers" else 7
     train, test = temporal_split(df)
 
-    tsf, tsf_fc, tsf_fit, tsf_pred = fit_tsf(
-        train, freq, lags, {family}, step_size=step_size
-    )
+    tsf_configs = {{
+        "TSF (nexcp=False, weighted_refit=False)": {{
+            "nexcp": False, "weighted_refit": False,
+        }},
+        "TSF (nexcp=True, weighted_refit=True)": {{
+            "nexcp": True, "weighted_refit": True,
+        }},
+    }}
+    for method, config in tsf_configs.items():
+        tsf, tsf_fc, tsf_fit, tsf_pred = fit_tsf(
+            train, freq, lags, {family}, step_size=step_size, **config
+        )
+        tsf_tab = prediction_table(tsf_fc, test)
+        predictions[(dataset_name, method)] = tsf_tab
+        results.append(metrics(tsf_tab, method, dataset_name, tsf_fit, tsf_pred))
     cps, cps_fc, cps_fit, cps_pred = fit_cps(
         train, freq, lags, discrete={discrete}, step_size=step_size
     )
@@ -304,16 +328,13 @@ for dataset_name, df in datasets.items():
     mscp, mscp_fc, mscp_fit, mscp_pred = fit_mscp(
         train, freq, lags, step_size=step_size
     )
-    tsf_tab = prediction_table(tsf_fc, test)
     cps_tab = prediction_table(cps_fc, test)
     tscqr_tab = conformal_prediction_table(tscqr_fc, test, "TSCQR")
     mscp_tab = conformal_prediction_table(mscp_fc, test, "MSCP")
-    predictions[(dataset_name, "TSF")] = tsf_tab
     predictions[(dataset_name, "CPS")] = cps_tab
     predictions[(dataset_name, "TSCQR")] = tscqr_tab
     predictions[(dataset_name, "MSCP")] = mscp_tab
     results += [
-        metrics(tsf_tab, "TSF", dataset_name, tsf_fit, tsf_pred),
         metrics(cps_tab, "CPS", dataset_name, cps_fit, cps_pred),
         metrics(tscqr_tab, "TSCQR", dataset_name, tscqr_fit, tscqr_pred),
         metrics(mscp_tab, "MSCP", dataset_name, mscp_fit, mscp_pred),
@@ -327,7 +348,11 @@ display(resultados.pivot(index="dataset", columns="method",
 
 PLOTS = r'''for dataset_name in datasets:
     plot_intervals(
-        {method: predictions[(dataset_name, method)] for method in ["TSF", "CPS", "TSCQR", "MSCP"]},
+        {method: predictions[(dataset_name, method)] for method in [
+            "TSF (nexcp=False, weighted_refit=False)",
+            "TSF (nexcp=True, weighted_refit=True)",
+            "CPS", "TSCQR", "MSCP",
+        ]},
         dataset_name,
     )
 
@@ -359,7 +384,7 @@ print("Leitura: cobertura isolada não premia intervalos excessivamente largos; 
 def notebook(title, intro, loader, discrete, weibull=False, timing_only=False):
     nb = nbf.v4.new_notebook()
     cells = [md(f"# {title}\n\n{intro}"), code(SETUP), code(HELPERS), code(loader)]
-    cells += [md("## Benchmark temporal\n\nA última janela é teste; todas as janelas anteriores são treino/calibração. O mesmo LightGBM, lags, horizonte, 12 janelas e sobreposição são usados por TSF, CPS, TSCQR e MSCP. `step_size=3` em AirPassengers e `step_size=7` nas demais séries; como ambos são menores que `H=14`, as janelas se sobrepõem."), code(benchmark_cell(discrete, weibull))]
+    cells += [md("## Benchmark temporal\n\nA última janela é teste; todas as janelas anteriores são treino/calibração. O mesmo LightGBM, lags, horizonte, 12 janelas e sobreposição são usados pelas duas versões do TSF, CPS, TSCQR e MSCP. O TSF é comparado sem ponderação (`nexcp=False`, `weighted_refit=False`) e com decaimento exponencial tanto na calibração quanto nos ajustes do modelo de média (`nexcp=True`, `weighted_refit=True`, `decay=0.99`). `step_size=3` em AirPassengers e `step_size=7` nas demais séries; como ambos são menores que `H=14`, as janelas se sobrepõem."), code(benchmark_cell(discrete, weibull))]
     if timing_only:
         cells += [md("## Comparação de tempo\n\nOs tempos abaixo são medições locais desta execução (`perf_counter`), com `n_jobs=1` e três repetições completas para reduzir ruído."), code(r'''timings = []
 for dataset_name, df in datasets.items():
@@ -367,12 +392,18 @@ for dataset_name, df in datasets.items():
     lags = [1, 12] if freq == "MS" else [1, 7, 28]
     step_size = 3 if dataset_name == "AirPassengers" else 7
     train, _ = temporal_split(df)
-    for method in ["TSF", "CPS", "TSCQR", "MSCP"]:
+    for method in [
+        "TSF (nexcp=False, weighted_refit=False)",
+        "TSF (nexcp=True, weighted_refit=True)",
+        "CPS", "TSCQR", "MSCP",
+    ]:
         fit_times, pred_times = [], []
         for repeat in range(3):
-            if method == "TSF":
+            if method.startswith("TSF"):
+                nexcp = "nexcp=True" in method
                 _, _, ft, pt = fit_tsf(
-                    train, freq, lags, WeibullFamily(), step_size=step_size
+                    train, freq, lags, WeibullFamily(), nexcp=nexcp,
+                    weighted_refit=nexcp, step_size=step_size
                 )
             elif method == "CPS":
                 _, _, ft, pt = fit_cps(
