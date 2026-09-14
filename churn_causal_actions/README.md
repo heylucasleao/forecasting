@@ -1,5 +1,14 @@
 # Ações causais para churn
 
+## Fluxo em etapas
+
+1. [`01_selecao_participantes`](01_selecao_participantes/README.md): modelo-base,
+   score out-of-fold, cutoff de inflexão, janela de candidatos e alocação
+   randomizada entre controle e tratamento.
+2. Estimação de efeitos: atualmente documentada no notebook
+   [`churn_observational_dml.ipynb`](churn_observational_dml.ipynb); será aplicada
+   depois que existirem ações e outcomes pós-intervenção.
+
 Este diretório descreve como passar de um **modelo de risco** (quem provavelmente
 vai churnar) para uma **política de ação** (qual ação reduz churn para cada
 cliente). As duas perguntas não são equivalentes: a probabilidade prevista não é
